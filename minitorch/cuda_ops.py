@@ -275,17 +275,24 @@ def _sum_practice(out: Storage, a: Storage, size: int) -> None:
     pos = cuda.threadIdx.x
 
     # TODO: Implement for Task 3.3.
-    if (pos == 0):
-        cache[cuda.blockIdx.x] = 0.0
-    cuda.syncthreads()
-
-    if (idx < size):
-        cuda.atomic.add(cache, cuda.blockIdx.x, a[i])
+    if idx >= size:
+        cache[pos] = 0.0
+    else:
+        cache[pos] = a[i]
 
     cuda.syncthreads()
-    if (pos == 0 and cuda.blockIdx.x < out.size):
-        out[cuda.blockIdx.x] = cache[cuda.blockIdx.x]
 
+    # Parallel reduction in shared memory
+    s = BLOCK_DIM // 2
+    while s >= 1:
+        if pos < s:
+            cache[pos] += cache[pos + s]
+        cuda.syncthreads()
+        s //= 2
+
+    # Write result for this block to global memory
+    if pos == 0:
+        out[cuda.blockIdx.x] = cache[0]
 
 jit_sum_practice = cuda.jit()(_sum_practice)
 
@@ -405,12 +412,12 @@ def _mm_practice(out: Storage, a: Storage, b: Storage, size: int) -> None:
         cache_b[row, col] = b[idx]
         cuda.syncthreads()  
         # accumulator for matmul results.
-        acc = 0.0  
+        tpm = 0.0  
         # matmul over the shared dimension
         for k in range(size):
-            acc += cache_a[row, k] * cache_b[k, col]
+            tpm += cache_a[row, k] * cache_b[k, col]
        
-        out[idx] = acc
+        out[idx] = tpm
 
 jit_mm_practice = jit(_mm_practice)
 
@@ -482,22 +489,39 @@ def _tensor_matrix_multiply(
     # x -> rows
     # j -> cols
 
-    tmp = numba.float64(0.)
+    tmp = 0.0
 
-    for k in range(0, a_shape[-1], BLOCK_DIM):
-        if i < a_shape[-2] and k + pj < a_shape[-1]:
-            a_shared[pi, pj] = a_storage[
-                batch * a_batch_stride + i * a_strides[-2] + (k + pj) * a_strides[-1]
-            ]
-        else:
-            a_shared[pi, pj] = 0.0
+    # Loop over tiles
+    for k_start in range(0, a_shape[-1], BLOCK_DIM):
+        # Zero shared memory
+        a_shared[pi, pj] = 0
+        b_shared[pi, pj] = 0
+        cuda.syncthreads()
 
-        if k + pi < b_shape[-2] and j < b_shape[-1]:
-            b_shared[pi, pj] = b_storage[
-                batch * b_batch_stride + (k + pi) * b_strides[-2] + j * b_strides[-1]
-            ]
-        else:
-            b_shared[pi, pj] = 0.0
+        # Load a tile from a into shared memory
+        if i < a_shape[-2] and (k_start + pj) < a_shape[-1]:
+            a_pos = (
+                batch * a_batch_stride
+                + i * a_strides[-2]
+                + (k_start + pj) * a_strides[-1]
+            )
+            a_shared[pi, pj] = a_storage[a_pos]
+
+        # Load a tile from b into shared memory
+        if (k_start + pi) < b_shape[-2] and j < b_shape[-1]:
+            b_pos = (
+                batch * b_batch_stride
+                + (k_start + pi) * b_strides[-2]
+                + j * b_strides[-1]
+            )
+            b_shared[pi, pj] = b_storage[b_pos]
+
+        cuda.syncthreads()
+
+        # Compute partial dot product for this tile
+        if i < a_shape[-2] and j < b_shape[-1]:
+            for k in range(min(BLOCK_DIM, a_shape[-1] - k_start)):
+                acc += a_shared[pi, k] * b_shared[k, pj]
 
         cuda.syncthreads()
 
@@ -507,8 +531,9 @@ def _tensor_matrix_multiply(
 
         cuda.syncthreads()
 
-    if i < out_shape[-2] and j < out_shape[-1]:
-        out[batch * out_strides[0] + i * out_strides[-2] + j * out_strides[-1]] = tmp
+    if i < a_shape[-2] and j < b_shape[-1]:
+        out_pos = batch * out_strides[0] + i * out_strides[-2] + j * out_strides[-1]
+        out[out_pos] = tmp
 
 
 tensor_matrix_multiply = jit(_tensor_matrix_multiply)
